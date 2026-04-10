@@ -39,6 +39,7 @@ var (
 		"hysteria":      func() interface{} { return new(HysteriaServerConfig) },
 		"masque":        func() interface{} { return new(MasqueServerConfig) },
 		"tun":           func() interface{} { return new(TunConfig) },
+		"anytls":        func() interface{} { return new(AnyTLSServerConfig) },
 	}, "protocol", "settings")
 
 	outboundConfigLoader = NewJSONConfigLoader(ConfigCreatorCache{
@@ -57,6 +58,7 @@ var (
 		"masque":      func() interface{} { return new(MasqueClientConfig) },
 		"dns":         func() interface{} { return new(DNSOutboundConfig) },
 		"wireguard":   func() interface{} { return &WireGuardConfig{IsClient: true} },
+		"anytls":      func() interface{} { return new(AnyTLSClientConfig) },
 	}, "protocol", "settings")
 )
 
