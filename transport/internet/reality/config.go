@@ -26,6 +26,7 @@ func (c *Config) GetREALITYConfig() *reality.Config {
 
 		MinClientVer: c.MinClientVer,
 		MaxClientVer: c.MaxClientVer,
+		NonPQMode:    c.NonPqMode,
 		MaxTimeDiff:  time.Duration(c.MaxTimeDiff) * time.Millisecond,
 
 		NextProtos:             nil, // should be nil

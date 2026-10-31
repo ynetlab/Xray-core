@@ -35,6 +35,7 @@ type REALITYConfig struct {
 	PrivateKey   string          `json:"privateKey"`
 	MinClientVer string          `json:"minClientVer"`
 	MaxClientVer string          `json:"maxClientVer"`
+	NonPQMode    string          `json:"nonPQMode"`
 	MaxTimeDiff  uint64          `json:"maxTimeDiff"`
 	ShortIds     []string        `json:"shortIds"`
 	Mldsa65Seed  string          `json:"mldsa65Seed"`
@@ -60,6 +61,12 @@ func (c *REALITYConfig) Build() (proto.Message, error) {
 		c.Dest = c.Target
 	}
 	if c.Dest != nil {
+		switch c.NonPQMode {
+		case "", "none", "legacy", "all":
+			config.NonPqMode = c.NonPQMode
+		default:
+			return nil, errors.New(`invalid "nonPQMode": expected none, legacy or all`)
+		}
 		var i uint16
 		var s string
 		if err = json.Unmarshal(c.Dest, &i); err == nil {
