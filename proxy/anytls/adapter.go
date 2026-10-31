@@ -77,56 +77,11 @@ func (h *inboundAdapter) handleUDP(ctx context.Context, conn net.Conn, p policy.
 // Each association destination gets a Dispatcher link, preserving routing and
 // stats while retaining domain addresses and complete datagrams through UoT2.
 func (h *inboundAdapter) dispatchPackets(ctx context.Context, conn net.Conn, packetConn *uot.Conn, p policy.Session) error {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	timer := signal.CancelAfterInactivity(ctx, cancel, p.Timeouts.ConnectionIdle)
-	defer timer.SetTimeout(0)
-	stop := context.AfterFunc(ctx, func() { conn.Close() })
-	defer stop()
-	links := make(map[xnet.Destination]*transport.Link)
-	var workers sync.WaitGroup
-	defer func() {
-		cancel()
-		conn.Close()
-		for _, link := range links {
-			common.Interrupt(link.Reader)
-			common.Interrupt(link.Writer)
-		}
-		workers.Wait()
-	}()
-	reader := &packetReader{conn: packetConn}
-	for {
-		mb, err := reader.ReadMultiBuffer()
-		if err != nil {
-			return err
-		}
-		packet := mb[0]
-		destination := *packet.UDP
-		if !destination.IsValid() {
-			buf.ReleaseMulti(mb)
-			return io.ErrUnexpectedEOF
-		}
-		link := links[destination]
-		if link == nil {
-			link, err = h.dispatcher.Dispatch(streamContext(ctx), destination)
-			if err != nil {
-				buf.ReleaseMulti(mb)
-				return err
-			}
-			links[destination] = link
-			workers.Add(1)
-			go func(link *transport.Link, destination xnet.Destination) {
-				defer workers.Done()
-				defer cancel()
-				writer := &packetWriter{conn: packetConn, destination: toSocksaddr(destination)}
-				_ = buf.Copy(link.Reader, writer, buf.UpdateActivity(timer))
-			}(link, destination)
-		}
-		timer.Update()
-		if err := link.Writer.WriteMultiBuffer(mb); err != nil {
-			return err
-		}
+	idle := udpTargetIdleTimeout
+	if p.Timeouts.ConnectionIdle > 0 && p.Timeouts.ConnectionIdle < idle {
+		idle = p.Timeouts.ConnectionIdle
 	}
+	return runUDPAssociation(ctx, conn, packetConn, p, h.dispatcher.Dispatch, idle, udpMaxTargets)
 }
 
 // relay owns both copy workers and joins them after interruption. Cancellation
