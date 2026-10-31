@@ -2,54 +2,43 @@ package anytls
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/binary"
+	"net"
 	"sync"
-	"sync/atomic"
 	"time"
 
+	singanytls "github.com/sagernet/sing-anytls"
+	"github.com/sagernet/sing/common/uot"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
+	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/retry"
-	sessionctx "github.com/xtls/xray-core/common/session"
-	core "github.com/xtls/xray-core/core"
+	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
-	"github.com/xtls/xray-core/transport/internet/stat"
 )
+
+type dialerKey struct{}
 
 const (
 	defaultIdleSessionCheckInterval = 30 * time.Second
 	defaultIdleSessionTimeout       = 60 * time.Second
-	defaultMinIdleSession           = 0
 )
 
 type Client struct {
 	server        *protocol.ServerSpec
 	policyManager policy.Manager
-
-	idleSessionCheckInterval time.Duration
-	idleSessionTimeout       time.Duration
-	minIdleSession           int
-
-	defaultPaddingScheme *paddingScheme
-	authPadding          uint16
-	authHash             [32]byte
-
-	poolMu       sync.Mutex
-	idleSessions []uint64
-	sessionsMu   sync.Mutex
-	sessions     map[uint64]*session
-	sessionSeq   atomic.Uint64
+	client        *singanytls.Client
+	closeContext  context.Context
+	cancel        context.CancelFunc
 }
 
 func NewClient(ctx context.Context, config *ClientConfig) (*Client, error) {
 	if config == nil || config.Server == nil {
 		return nil, errors.New("anytls: no server specified")
 	}
-
 	server, err := protocol.NewServerSpecFromPB(config.Server)
 	if err != nil {
 		return nil, errors.New("failed to get server spec").Base(err)
@@ -61,222 +50,118 @@ func NewClient(ctx context.Context, config *ClientConfig) (*Client, error) {
 	if !ok {
 		return nil, errors.New("anytls: invalid account type")
 	}
-
 	v := core.MustFromContext(ctx)
-	client := &Client{
-		server:                   server,
-		policyManager:            v.GetFeature(policy.ManagerType()).(policy.Manager),
-		idleSessionCheckInterval: defaultIdleSessionCheckInterval,
-		idleSessionTimeout:       defaultIdleSessionTimeout,
-		minIdleSession:           defaultMinIdleSession,
-		defaultPaddingScheme:     getDefaultPaddingScheme(),
-		authHash:                 sha256.Sum256([]byte(account.Password)),
-		sessions:                 make(map[uint64]*session),
+	c := &Client{server: server, policyManager: v.GetFeature(policy.ManagerType()).(policy.Manager)}
+	c.closeContext, c.cancel = context.WithCancel(ctx)
+	checkInterval, idleTimeout := defaultIdleSessionCheckInterval, defaultIdleSessionTimeout
+	if config.GetIdleSessionCheckInterval() > 0 {
+		checkInterval = time.Duration(config.GetIdleSessionCheckInterval()) * time.Second
 	}
-	client.authPadding = getPadding0Size(client.defaultPaddingScheme)
-	if value := config.GetIdleSessionCheckInterval(); value > 0 {
-		client.idleSessionCheckInterval = time.Duration(value) * time.Second
+	if config.GetIdleSessionTimeout() > 0 {
+		idleTimeout = time.Duration(config.GetIdleSessionTimeout()) * time.Second
 	}
-	if value := config.GetIdleSessionTimeout(); value > 0 {
-		client.idleSessionTimeout = time.Duration(value) * time.Second
+	c.client, err = singanytls.NewClient(singanytls.ClientOptions{
+		Password: account.Password, ClientMetadata: "xray",
+		IdleSessionCheckInterval: checkInterval,
+		IdleSessionTimeout:       idleTimeout,
+		MinIdleSession:           int(config.GetMinIdleSession()),
+		DialOut: func(ctx context.Context) (net.Conn, error) {
+			dialer, ok := ctx.Value(dialerKey{}).(internet.Dialer)
+			if !ok {
+				return nil, errors.New("anytls: missing Xray dialer")
+			}
+			var conn net.Conn
+			err := retry.ExponentialBackoff(5, 100).On(func() error {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				var err error
+				conn, err = dialer.Dial(ctx, server.Destination)
+				return err
+			})
+			if err != nil {
+				return nil, err
+			}
+			guard := &handshakeConn{Conn: conn, ctx: ctx, timeout: c.policyManager.ForLevel(server.User.Level).Timeouts.Handshake}
+			guard.stop = context.AfterFunc(ctx, func() { conn.Close() })
+			return guard, nil
+		},
+	})
+	if err != nil {
+		c.cancel()
+		return nil, err
 	}
-	client.minIdleSession = int(config.GetMinIdleSession())
-	go client.cleanupIdleSessions()
-	return client, nil
+	return c, nil
+}
+
+func (c *Client) Close() error {
+	c.cancel()
+	return c.client.Close()
+}
+
+// The library registers a session after its authentication write. Bound and
+// cancel that initial write too, without binding the pooled connection to the
+// lifetime of its first stream after the handshake has completed.
+type handshakeConn struct {
+	net.Conn
+	ctx     context.Context
+	timeout time.Duration
+	first   sync.Once
+	stop    func() bool
+}
+
+func (c *handshakeConn) Write(p []byte) (n int, err error) {
+	initial := false
+	c.first.Do(func() {
+		initial = true
+		deadline := time.Now().Add(c.timeout)
+		if value, ok := c.ctx.Deadline(); ok && value.Before(deadline) {
+			deadline = value
+		}
+		if err = c.Conn.SetWriteDeadline(deadline); err == nil {
+			n, err = c.Conn.Write(p)
+		}
+		c.stop()
+	})
+	if initial {
+		return
+	}
+	return c.Conn.Write(p)
+}
+
+func (c *handshakeConn) Close() error {
+	c.stop()
+	return c.Conn.Close()
 }
 
 func (c *Client) Process(ctx context.Context, link *transport.Link, dialer internet.Dialer) error {
-	outbounds := sessionctx.OutboundsFromContext(ctx)
-	ob := outbounds[len(outbounds)-1]
-	if !ob.Target.IsValid() {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stop := context.AfterFunc(c.closeContext, cancel)
+	defer stop()
+	outbounds := session.OutboundsFromContext(ctx)
+	if len(outbounds) == 0 || !outbounds[len(outbounds)-1].Target.IsValid() {
 		return errors.New("target not specified")
 	}
-	ob.Name = "anytls"
-	ob.CanSpliceCopy = 3
-	destination := ob.Target
-
-	server := c.server
-	dest := server.Destination
-
-	var sess *session
-	c.poolMu.Lock()
-	c.sessionsMu.Lock()
-	for len(c.idleSessions) > 0 {
-		last := len(c.idleSessions) - 1
-		seq := c.idleSessions[last]
-		c.idleSessions = c.idleSessions[:last]
-		sess = c.sessions[seq]
-		if sess == nil {
-			continue
-		}
-		sess.inIdlePool.Store(false)
-		if sess.isClosed() {
-			sess = nil
-			continue
-		}
-		break
+	ob := outbounds[len(outbounds)-1]
+	ob.Name, ob.CanSpliceCopy = protocolName, 3
+	target := toSocksaddr(ob.Target)
+	if ob.Target.Network == xnet.Network_UDP {
+		target = uot.RequestDestination(uot.Version)
 	}
-	c.sessionsMu.Unlock()
-	c.poolMu.Unlock()
-
-	if sess == nil {
-		seq := c.sessionSeq.Add(1)
-		var conn stat.Connection
-		err := retry.ExponentialBackoff(5, 100).On(func() error {
-			rawConn, err := dialer.Dial(ctx, dest)
-			if err != nil {
-				return err
-			}
-			conn = rawConn
-			return nil
-		})
-		if err != nil {
-			return errors.New("anytls: failed to establish connection").Base(err)
-		}
-
-		var auth [34]byte
-		copy(auth[:32], c.authHash[:])
-		binary.BigEndian.PutUint16(auth[32:34], c.authPadding)
-		if _, err := conn.Write(auth[:]); err != nil {
-			conn.Close()
-			return errors.New("anytls: write auth failed").Base(err)
-		}
-		if c.authPadding > 0 {
-			pad := buf.New()
-			pad.Extend(int32(c.authPadding))
-			_, err := conn.Write(pad.Bytes())
-			pad.Release()
-			if err != nil {
-				conn.Close()
-				return errors.New("anytls: write padding failed").Base(err)
-			}
-		}
-
-		sess = &session{
-			client:        c,
-			isClient:      true,
-			conn:          conn,
-			br:            &buf.BufferedReader{Reader: buf.NewReader(conn)},
-			bw:            buf.NewBufferedWriter(buf.NewWriter(conn)),
-			paddingScheme: c.defaultPaddingScheme,
-			streams:       make(map[uint32]*stream),
-			synAckCh:      make(map[uint32]chan error),
-			errCh:         make(chan error, 1),
-			seq:           seq,
-		}
-		sess.fw = newFrameWriter(sess.bw)
-		sess.nextSID.Store(1)
-		sess.pktCounter.Store(1)
-		sess.peerVersion = 1
-		sess.dieHook = func() {
-			c.sessionsMu.Lock()
-			delete(c.sessions, sess.seq)
-			c.sessionsMu.Unlock()
-		}
-		c.sessionsMu.Lock()
-		c.sessions[seq] = sess
-		c.sessionsMu.Unlock()
-		errors.LogDebug(ctx, "anytls: new session created, seq=", seq)
-
-		go func() {
-			if err := sess.readLoop(ctx); err != nil && !sess.isClosed() {
-				sess.close(err)
-			}
-		}()
-	}
-
-	stream, err := sess.openStream(ctx, destination, link)
+	conn, err := c.client.DialContext(context.WithValue(ctx, dialerKey{}, dialer), target)
 	if err != nil {
-		sess.close(err)
 		return errors.New("anytls: failed to open stream").Base(err)
 	}
-	stream.dieHook = func() {
-		if sess.isClosed() || sess.activeStreams.Load() != 0 {
-			return
-		}
-		c.markSessionIdle(sess)
+	defer conn.Close()
+	var reader buf.Reader = buf.NewReader(conn)
+	var writer buf.Writer = buf.NewWriter(conn)
+	if ob.Target.Network == xnet.Network_UDP {
+		request := uot.Request{IsConnect: true, Destination: toSocksaddr(ob.Target)}
+		packetConn := uot.NewLazyConn(conn, request)
+		reader = &packetReader{conn: packetConn}
+		writer = &packetWriter{conn: packetConn, destination: request.Destination}
 	}
-	go stream.pumpUplink(sess)
-
-	select {
-	case <-stream.done:
-		return stream.result()
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-func (c *Client) markSessionIdle(sess *session) {
-	if sess == nil || sess.isClosed() {
-		return
-	}
-	if !sess.inIdlePool.CompareAndSwap(false, true) {
-		return
-	}
-	sess.idleSinceNano.Store(time.Now().UnixNano())
-
-	c.poolMu.Lock()
-	c.idleSessions = append(c.idleSessions, sess.seq)
-	c.poolMu.Unlock()
-}
-
-func (c *Client) cleanupIdleSessions() {
-	ticker := time.NewTicker(c.idleSessionCheckInterval)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		now := time.Now()
-		var toClose []*session
-
-		c.poolMu.Lock()
-		if len(c.idleSessions) == 0 {
-			c.poolMu.Unlock()
-			continue
-		}
-
-		c.sessionsMu.Lock()
-		validCount := 0
-		for _, seq := range c.idleSessions {
-			sess := c.sessions[seq]
-			if sess == nil || sess.isClosed() || !sess.inIdlePool.Load() {
-				continue
-			}
-			c.idleSessions[validCount] = seq
-			validCount++
-		}
-		c.idleSessions = c.idleSessions[:validCount]
-
-		keepFrom := validCount - c.minIdleSession
-		if keepFrom < 0 {
-			keepFrom = 0
-		}
-
-		keptCount := 0
-		for idx, seq := range c.idleSessions {
-			sess := c.sessions[seq]
-			if sess == nil {
-				continue
-			}
-			if idx >= keepFrom {
-				c.idleSessions[keptCount] = seq
-				keptCount++
-				continue
-			}
-			idleSinceNano := sess.idleSinceNano.Load()
-			if idleSinceNano == 0 || now.Sub(time.Unix(0, idleSinceNano)) <= c.idleSessionTimeout {
-				c.idleSessions[keptCount] = seq
-				keptCount++
-				continue
-			}
-			sess.inIdlePool.Store(false)
-			toClose = append(toClose, sess)
-		}
-		c.sessionsMu.Unlock()
-		c.idleSessions = c.idleSessions[:keptCount]
-		c.poolMu.Unlock()
-
-		for _, sess := range toClose {
-			sess.close(nil)
-		}
-	}
+	p := c.policyManager.ForLevel(c.server.User.Level)
+	return relay(ctx, conn, link, reader, writer, p, false)
 }

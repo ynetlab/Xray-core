@@ -69,3 +69,4 @@ ehthumbs.db
 
 # Keep local tests and implementation notes out of new commits.
 *test.go
+testing/*
