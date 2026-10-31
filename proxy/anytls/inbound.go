@@ -2,6 +2,7 @@ package anytls
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"io"
 	"sync"
@@ -20,25 +21,18 @@ import (
 
 type Server struct {
 	policyManager policy.Manager
-	users         map[[32]byte]authenticatedUser
+	users         map[[32]byte]*protocol.MemoryUser
 	usersByEmail  map[string]*protocol.MemoryUser
-	usersByID     map[string]*protocol.MemoryUser
 	userMu        sync.RWMutex
 	paddingScheme string
-}
-
-type authenticatedUser struct {
-	user  *protocol.MemoryUser
-	route xnet.Port
 }
 
 func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 	v := core.MustFromContext(ctx)
 	s := &Server{
 		policyManager: v.GetFeature(policy.ManagerType()).(policy.Manager),
-		users:         make(map[[32]byte]authenticatedUser),
+		users:         make(map[[32]byte]*protocol.MemoryUser),
 		usersByEmail:  make(map[string]*protocol.MemoryUser),
-		usersByID:     make(map[string]*protocol.MemoryUser),
 		paddingScheme: config.PaddingScheme,
 	}
 	for _, u := range config.Users {
@@ -46,9 +40,13 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 		if err != nil {
 			return nil, errors.New("anytls: bad user").Base(err)
 		}
-		if err := s.AddUser(ctx, mu); err != nil {
-			return nil, err
+		acc, ok := mu.Account.(*MemoryAccount)
+		if !ok {
+			return nil, errors.New("anytls: user account type")
 		}
+		sum := sha256.Sum256([]byte(acc.Password))
+		s.users[sum] = mu
+		s.usersByEmail[mu.Email] = mu
 	}
 	return s, nil
 }
@@ -82,9 +80,9 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 	var sum [32]byte
 	copy(sum[:], h[:32])
 	s.userMu.RLock()
-	auth := s.users[sum]
+	user := s.users[sum]
 	s.userMu.RUnlock()
-	if auth.user == nil {
+	if user == nil {
 		return errors.New("anytls: invalid user")
 	}
 
@@ -98,8 +96,7 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 
 	inb := sessionctx.InboundFromContext(ctx)
 	inb.Name = protocolName
-	inb.User = auth.user
-	inb.VlessRoute = auth.route
+	inb.User = user
 	inb.CanSpliceCopy = 3
 
 	return sess.readLoop(ctx)
