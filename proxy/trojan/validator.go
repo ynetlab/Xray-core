@@ -5,78 +5,93 @@ import (
 	"sync"
 
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
+	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/proxy/uuidroute"
 )
 
-// Validator stores valid trojan users.
+// Validator stores valid trojan users. Its zero value remains usable.
 type Validator struct {
-	// Considering email's usage here, map + sync.Mutex/RWMutex may have better performance.
-	email sync.Map
-	users sync.Map
+	router routing.Router
+	once   sync.Once
+	index  *uuidroute.Validator
+}
+
+func (v *Validator) userIndex() *uuidroute.Validator {
+	v.once.Do(func() {
+		v.index = uuidroute.NewValidator(v.router, func(password string) string {
+			return hexString(hexSha224(password))
+		}, strings.ToLower)
+	})
+	return v.index
 }
 
 // Add a trojan user, Email must be empty or unique.
-func (v *Validator) Add(u *protocol.MemoryUser) error {
-	if u.Email != "" {
-		_, loaded := v.email.LoadOrStore(strings.ToLower(u.Email), u)
-		if loaded {
-			return errors.New("User ", u.Email, " already exists.")
+func (v *Validator) Add(user *protocol.MemoryUser) error {
+	return v.addUsers([]*protocol.MemoryUser{user})
+}
+
+func (v *Validator) addUsers(users []*protocol.MemoryUser) error {
+	credentials := make([]uuidroute.Credential, 0, len(users))
+	for _, user := range users {
+		if user == nil {
+			return errors.New("invalid trojan user")
 		}
+		account, ok := user.Account.(*MemoryAccount)
+		if !ok {
+			return errors.New("invalid trojan account type")
+		}
+		userCopy, accountCopy := *user, *account
+		accountCopy.Key = append([]byte(nil), account.Key...)
+		userCopy.Account = &accountCopy
+		credentials = append(credentials, uuidroute.Credential{User: &userCopy, Password: accountCopy.Password})
 	}
-	v.users.Store(hexString(u.Account.(*MemoryAccount).Key), u)
-	return nil
+	return v.userIndex().AddUsers(credentials, false)
 }
 
 // Del a trojan user with a non-empty Email.
-func (v *Validator) Del(e string) error {
-	if e == "" {
+func (v *Validator) Del(email string) error {
+	if email == "" {
 		return errors.New("Email must not be empty.")
 	}
-	le := strings.ToLower(e)
-	u, _ := v.email.Load(le)
-	if u == nil {
-		return errors.New("User ", e, " not found.")
+	removed, err := v.userIndex().Remove(email)
+	if err != nil {
+		return err
 	}
-	v.email.Delete(le)
-	v.users.Delete(hexString(u.(*protocol.MemoryUser).Account.(*MemoryAccount).Key))
+	if !removed {
+		return errors.New("User ", email, " not found.")
+	}
 	return nil
 }
 
-// Get a trojan user with hashed key, nil if user doesn't exist.
+// Get preserves the existing hashed-key lookup interface.
 func (v *Validator) Get(hash string) *protocol.MemoryUser {
-	u, _ := v.users.Load(hash)
-	if u != nil {
-		return u.(*protocol.MemoryUser)
-	}
-	return nil
+	user, _ := v.GetWithRoute(hash)
+	return user
 }
 
-// Get a trojan user with hashed key, nil if user doesn't exist.
+func (v *Validator) GetWithRoute(hash string) (*protocol.MemoryUser, net.Port) {
+	match := v.userIndex().Authenticate(hash)
+	return match.User, match.Route
+}
+
 func (v *Validator) GetByEmail(email string) *protocol.MemoryUser {
-	email = strings.ToLower(email)
-	u, _ := v.email.Load(email)
-	if u != nil {
-		return u.(*protocol.MemoryUser)
-	}
-	return nil
+	return v.userIndex().GetByEmail(email)
 }
 
-// Get all users
+// GetAll retains the existing API's Email-addressable user list.
 func (v *Validator) GetAll() []*protocol.MemoryUser {
-	u := make([]*protocol.MemoryUser, 0, 100)
-	v.email.Range(func(key, value interface{}) bool {
-		u = append(u, value.(*protocol.MemoryUser))
-		return true
-	})
-	return u
+	users := v.userIndex().GetAll()
+	result := make([]*protocol.MemoryUser, 0, len(users))
+	for _, user := range users {
+		if user.Email != "" {
+			result = append(result, user)
+		}
+	}
+	return result
 }
 
-// Get users count
 func (v *Validator) GetCount() int64 {
-	var c int64 = 0
-	v.email.Range(func(key, value interface{}) bool {
-		c++
-		return true
-	})
-	return c
+	return int64(len(v.GetAll()))
 }

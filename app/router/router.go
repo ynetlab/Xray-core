@@ -8,6 +8,7 @@ import (
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/dns"
@@ -24,10 +25,11 @@ type Router struct {
 	balancers      atomic.Pointer[map[string]*Balancer]
 	dns            dns.Client
 
-	ctx        context.Context
-	ohm        outbound.Manager
-	dispatcher routing.Dispatcher
-	mu         sync.Mutex
+	ctx         context.Context
+	ohm         outbound.Manager
+	dispatcher  routing.Dispatcher
+	mu          sync.RWMutex
+	vlessRoutes *routing.VlessRouteSnapshot
 }
 
 // Route is an implementation of routing.Route.
@@ -132,6 +134,9 @@ func (r *Router) ReloadRules(config *Config, shouldAppend bool) error {
 			Tag:       rule.GetTag(),
 			RuleTag:   rule.GetRuleTag(),
 		}
+		if rule.VlessRouteList != nil {
+			rr.vlessRoutes = net.PortListFromProto(rule.VlessRouteList)
+		}
 		if rr.RuleTag != "" && existTags[rr.RuleTag] {
 			return errors.New("duplicate ruleTag ", rr.RuleTag)
 		}
@@ -155,6 +160,7 @@ func (r *Router) ReloadRules(config *Config, shouldAppend bool) error {
 
 	r.balancers.Store(&newBalancers)
 	r.rules.Store(&newRules)
+	r.publishVlessRoutes(newRules)
 	if !shouldAppend {
 		closeWebhooks(oldRules)
 	}
@@ -181,6 +187,7 @@ func (r *Router) RemoveRule(tag string) error {
 		}
 	}
 	r.rules.Store(&newRules)
+	r.publishVlessRoutes(newRules)
 	closeWebhooks(removed)
 	return nil
 }

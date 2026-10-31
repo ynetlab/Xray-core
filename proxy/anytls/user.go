@@ -6,85 +6,61 @@ import (
 
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/protocol"
+	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/proxy/uuidroute"
 )
 
-// AddUser implements proxy.UserManager.AddUser().
-func (s *Server) AddUser(ctx context.Context, u *protocol.MemoryUser) error {
-	if u == nil || u.Account == nil {
-		return errors.New("anytls: invalid user")
-	}
-	acc, ok := u.Account.(*MemoryAccount)
-	if !ok {
-		return errors.New("anytls: invalid account type")
-	}
-
-	sum := sha256.Sum256([]byte(acc.Password))
-
-	s.userMu.Lock()
-	defer s.userMu.Unlock()
-
-	if prev, ok := s.usersByEmail[u.Email]; ok {
-		prevAcc, ok := prev.Account.(*MemoryAccount)
-		if ok {
-			prevSum := sha256.Sum256([]byte(prevAcc.Password))
-			if prevSum != sum {
-				delete(s.users, prevSum)
-			}
-		}
-	}
-	s.users[sum] = u
-	s.usersByEmail[u.Email] = u
-	return nil
+func newUserValidator(router routing.Router) *uuidroute.Validator {
+	return uuidroute.NewValidator(router, func(password string) string {
+		hash := sha256.Sum256([]byte(password))
+		return string(hash[:])
+	}, func(email string) string { return email })
 }
 
-// RemoveUser implements proxy.UserManager.RemoveUser().
+// AddUser implements proxy.UserManager.AddUser, replacing an existing Email.
+func (s *Server) AddUser(ctx context.Context, user *protocol.MemoryUser) error {
+	credential, err := userCredential(user)
+	if err != nil {
+		return err
+	}
+	return s.validator.Add(credential.User, credential.Password, true)
+}
+
+func userCredential(user *protocol.MemoryUser) (uuidroute.Credential, error) {
+	if user == nil || user.Account == nil {
+		return uuidroute.Credential{}, errors.New("anytls: invalid user")
+	}
+	account, ok := user.Account.(*MemoryAccount)
+	if !ok {
+		return uuidroute.Credential{}, errors.New("anytls: invalid account type")
+	}
+	if account.Password == "" {
+		return uuidroute.Credential{}, errors.New("anytls: user password required")
+	}
+	userCopy, accountCopy := *user, *account
+	userCopy.Account = &accountCopy
+	return uuidroute.Credential{User: &userCopy, Password: accountCopy.Password}, nil
+}
+
 func (s *Server) RemoveUser(ctx context.Context, email string) error {
 	if email == "" {
 		return errors.New("anytls: empty email")
 	}
-
-	s.userMu.Lock()
-	defer s.userMu.Unlock()
-
-	if user, ok := s.usersByEmail[email]; ok {
-		delete(s.usersByEmail, email)
-		acc, ok := user.Account.(*MemoryAccount)
-		if ok {
-			sum := sha256.Sum256([]byte(acc.Password))
-			delete(s.users, sum)
-		}
-	}
-	return nil
+	_, err := s.validator.Remove(email)
+	return err
 }
 
-// GetUser implements proxy.UserManager.GetUser().
 func (s *Server) GetUser(ctx context.Context, email string) *protocol.MemoryUser {
 	if email == "" {
 		return nil
 	}
-
-	s.userMu.RLock()
-	defer s.userMu.RUnlock()
-
-	return s.usersByEmail[email]
+	return s.validator.GetByEmail(email)
 }
 
-// GetUsers implements proxy.UserManager.GetUsers().
 func (s *Server) GetUsers(ctx context.Context) []*protocol.MemoryUser {
-	s.userMu.RLock()
-	defer s.userMu.RUnlock()
-
-	users := make([]*protocol.MemoryUser, 0, len(s.users))
-	for _, u := range s.users {
-		users = append(users, u)
-	}
-	return users
+	return s.validator.GetAll()
 }
 
-// GetUsersCount implements proxy.UserManager.GetUsersCount().
 func (s *Server) GetUsersCount(ctx context.Context) int64 {
-	s.userMu.RLock()
-	defer s.userMu.RUnlock()
-
-	return int64(len(s.users))
+	return s.validator.GetCount()
 }

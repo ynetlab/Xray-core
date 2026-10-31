@@ -43,19 +43,21 @@ type Server struct {
 
 // NewServer creates a new trojan inbound handler.
 func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
-	validator := new(Validator)
+	v := core.MustFromContext(ctx)
+	validator := &Validator{router: v.GetFeature(routing.RouterType()).(routing.Router)}
+	users := make([]*protocol.MemoryUser, 0, len(config.Users))
 	for _, user := range config.Users {
 		u, err := user.ToMemoryUser()
 		if err != nil {
 			return nil, errors.New("failed to get trojan user").Base(err)
 		}
 
-		if err := validator.Add(u); err != nil {
-			return nil, errors.New("failed to add user").Base(err)
-		}
+		users = append(users, u)
+	}
+	if err := validator.addUsers(users); err != nil {
+		return nil, errors.New("failed to add user").Base(err)
 	}
 
-	v := core.MustFromContext(ctx)
 	server := &Server{
 		policyManager: v.GetFeature(policy.ManagerType()).(policy.Manager),
 		validator:     validator,
@@ -173,6 +175,7 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 	isfb := napfb != nil
 
 	shouldFallback := false
+	var vlessRoute net.Port
 	if firstLen < 58 || first.Byte(56) != '\r' {
 		// invalid protocol
 		err = errors.New("not trojan protocol")
@@ -185,7 +188,7 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 
 		shouldFallback = true
 	} else {
-		user = s.validator.Get(hexString(first.BytesTo(56)))
+		user, vlessRoute = s.validator.GetWithRoute(hexString(first.BytesTo(56)))
 		if user == nil {
 			// invalid user, let's fallback
 			err = errors.New("not a valid user")
@@ -226,6 +229,7 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 	inbound.Name = "trojan"
 	inbound.CanSpliceCopy = 3
 	inbound.User = user
+	inbound.VlessRoute = vlessRoute
 	sessionPolicy = s.policyManager.ForLevel(user.Level)
 
 	if destination.Network == net.Network_UDP { // handle udp request

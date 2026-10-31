@@ -2,28 +2,24 @@ package anytls
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/binary"
 	"io"
-	"sync"
 	"time"
 
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
 	xnet "github.com/xtls/xray-core/common/net"
-	"github.com/xtls/xray-core/common/protocol"
 	sessionctx "github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/proxy/uuidroute"
 	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
 type Server struct {
 	policyManager policy.Manager
-	users         map[[32]byte]*protocol.MemoryUser
-	usersByEmail  map[string]*protocol.MemoryUser
-	userMu        sync.RWMutex
+	validator     *uuidroute.Validator
 	paddingScheme string
 }
 
@@ -31,22 +27,23 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 	v := core.MustFromContext(ctx)
 	s := &Server{
 		policyManager: v.GetFeature(policy.ManagerType()).(policy.Manager),
-		users:         make(map[[32]byte]*protocol.MemoryUser),
-		usersByEmail:  make(map[string]*protocol.MemoryUser),
+		validator:     newUserValidator(v.GetFeature(routing.RouterType()).(routing.Router)),
 		paddingScheme: config.PaddingScheme,
 	}
+	credentials := make([]uuidroute.Credential, 0, len(config.Users))
 	for _, u := range config.Users {
 		mu, err := u.ToMemoryUser()
 		if err != nil {
 			return nil, errors.New("anytls: bad user").Base(err)
 		}
-		acc, ok := mu.Account.(*MemoryAccount)
-		if !ok {
-			return nil, errors.New("anytls: user account type")
+		credential, err := userCredential(mu)
+		if err != nil {
+			return nil, err
 		}
-		sum := sha256.Sum256([]byte(acc.Password))
-		s.users[sum] = mu
-		s.usersByEmail[mu.Email] = mu
+		credentials = append(credentials, credential)
+	}
+	if err := s.validator.AddUsers(credentials, true); err != nil {
+		return nil, err
 	}
 	return s, nil
 }
@@ -77,12 +74,8 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 		return errors.New("anytls: read auth").Base(err)
 	}
 
-	var sum [32]byte
-	copy(sum[:], h[:32])
-	s.userMu.RLock()
-	user := s.users[sum]
-	s.userMu.RUnlock()
-	if user == nil {
+	auth := s.validator.Authenticate(string(h[:32]))
+	if auth.User == nil {
 		return errors.New("anytls: invalid user")
 	}
 
@@ -96,7 +89,8 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 
 	inb := sessionctx.InboundFromContext(ctx)
 	inb.Name = protocolName
-	inb.User = user
+	inb.User = auth.User
+	inb.VlessRoute = auth.Route
 	inb.CanSpliceCopy = 3
 
 	return sess.readLoop(ctx)
