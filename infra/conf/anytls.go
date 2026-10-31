@@ -1,6 +1,8 @@
 package conf
 
 import (
+	"encoding/json"
+	"strconv"
 	"strings"
 
 	"github.com/xtls/xray-core/common/errors"
@@ -17,8 +19,9 @@ type AnyTLSUser struct {
 }
 
 type AnyTLSServerConfig struct {
-	Users         []*AnyTLSUser `json:"users"`
-	PaddingScheme []string      `json:"paddingScheme"`
+	Users         []*AnyTLSUser            `json:"users"`
+	PaddingScheme []string                 `json:"paddingScheme"`
+	Fallbacks     []*TrojanInboundFallback `json:"fallbacks"`
 }
 
 func (c *AnyTLSServerConfig) Build() (proto.Message, error) {
@@ -27,6 +30,22 @@ func (c *AnyTLSServerConfig) Build() (proto.Message, error) {
 	}
 	if len(c.PaddingScheme) > 0 {
 		cfg.PaddingScheme = strings.Join(c.PaddingScheme, "\n")
+	}
+	for _, fb := range c.Fallbacks {
+		if fb == nil || fb.Name != "" || fb.Path != "" || fb.Xver != 0 {
+			return nil, errors.New("ANYTLS: fallbacks support dest, type and alpn only")
+		}
+		var dest string
+		var port uint16
+		if err := json.Unmarshal(fb.Dest, &port); err == nil && port != 0 {
+			dest = strconv.Itoa(int(port))
+		} else if err := json.Unmarshal(fb.Dest, &dest); err != nil || dest == "" {
+			return nil, errors.New("ANYTLS: fallback dest must be a port or address")
+		}
+		cfg.Fallbacks = append(cfg.Fallbacks, &anytls.Fallback{Alpn: fb.Alpn, Type: fb.Type, Dest: dest})
+	}
+	if err := anytls.ValidateFallbacks(cfg.Fallbacks); err != nil {
+		return nil, err
 	}
 	for _, u := range c.Users {
 		if u.Password == "" {

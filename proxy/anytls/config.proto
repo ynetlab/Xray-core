@@ -16,6 +16,13 @@ message Account {
 message ServerConfig {
   repeated xray.common.protocol.User users = 1;
   string padding_scheme = 2;
+  repeated Fallback fallbacks = 3;
+}
+
+message Fallback {
+  string alpn = 1;
+  string type = 2;
+  string dest = 3;
 }
 
 message ClientConfig {

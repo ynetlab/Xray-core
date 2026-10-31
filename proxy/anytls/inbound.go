@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	stderrors "errors"
 	"io"
 	"net"
 	"sync"
@@ -28,9 +29,11 @@ type Server struct {
 	policyManager policy.Manager
 	validator     *uuidroute.Validator
 	paddingScheme string
+	fallback      *fallbackHandler
 	mu            sync.Mutex
+	workers       sync.WaitGroup
 	closed        bool
-	connections   map[net.Conn]struct{}
+	connections   map[net.Conn]context.CancelFunc
 }
 
 func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
@@ -39,10 +42,17 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 		policyManager: v.GetFeature(policy.ManagerType()).(policy.Manager),
 		validator:     newUserValidator(v.GetFeature(routing.RouterType()).(routing.Router)),
 		paddingScheme: config.PaddingScheme,
-		connections:   make(map[net.Conn]struct{}),
+		connections:   make(map[net.Conn]context.CancelFunc),
 	}
 	if _, err := singanytls.NewService("", singanytls.ServiceOptions{PaddingScheme: []byte(s.paddingScheme)}); err != nil {
 		return nil, err
+	}
+	if len(config.Fallbacks) > 0 {
+		var err error
+		s.fallback, err = newFallbackHandler(config.Fallbacks, s.policyManager, s.paddingScheme)
+		if err != nil {
+			return nil, err
+		}
 	}
 	credentials := make([]uuidroute.Credential, 0, len(config.Users))
 	for _, u := range config.Users {
@@ -69,18 +79,22 @@ func (s *Server) Network() []xnet.Network {
 func (s *Server) Close() error {
 	s.mu.Lock()
 	s.closed = true
-	connections := make([]net.Conn, 0, len(s.connections))
-	for conn := range s.connections {
-		connections = append(connections, conn)
+	connections := make(map[net.Conn]context.CancelFunc, len(s.connections))
+	for conn, cancel := range s.connections {
+		connections[conn] = cancel
 	}
 	s.mu.Unlock()
-	for _, conn := range connections {
+	for conn, cancel := range connections {
+		cancel()
 		conn.Close()
 	}
+	s.workers.Wait()
 	return nil
 }
 
 func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Connection, dispatcher routing.Dispatcher) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -88,21 +102,35 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 		return net.ErrClosed
 	}
 	if s.connections == nil {
-		s.connections = make(map[net.Conn]struct{})
+		s.connections = make(map[net.Conn]context.CancelFunc)
 	}
-	s.connections[conn] = struct{}{}
+	s.connections[conn] = cancel
+	s.workers.Add(1)
 	s.mu.Unlock()
+	defer s.workers.Done()
 	defer func() {
 		conn.Close()
 		s.mu.Lock()
 		delete(s.connections, conn)
 		s.mu.Unlock()
 	}()
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
 	stop := context.AfterFunc(ctx, func() { conn.Close() })
 	defer stop()
-	if err := conn.SetReadDeadline(time.Now().Add(s.policyManager.ForLevel(0).Timeouts.Handshake)); err != nil {
+	handshakeTimeout := s.policyManager.ForLevel(0).Timeouts.Handshake
+	var release func()
+	if s.fallback != nil {
+		select {
+		case s.fallback.slots <- struct{}{}:
+			release = sync.OnceFunc(func() { <-s.fallback.slots })
+			defer release()
+		default:
+			return errors.New("anytls: authentication/fallback connection limit reached")
+		}
+		if handshakeTimeout <= 0 || handshakeTimeout > fallbackAuthTimeout {
+			handshakeTimeout = fallbackAuthTimeout
+		}
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(handshakeTimeout)); err != nil {
 		return err
 	}
 
@@ -110,12 +138,37 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 	// select the immutable UUID-route match, then replay it unchanged. Coalescing
 	// the digest also accommodates upstream's single ReadOnceFrom on TCP.
 	var digest [sha256.Size]byte
-	if _, err := io.ReadFull(conn, digest[:]); err != nil {
-		return errors.New("anytls: read credential selector").Base(err)
+	n, err := io.ReadFull(conn, digest[:])
+	if err != nil {
+		timeout, isNetError := err.(net.Error)
+		// A complete short HTTP request can be less than 32 bytes and wait for
+		// a response without half-closing. At the authentication deadline replay
+		// its partial prefix to the fixed fallback, rather than discarding it.
+		if s.fallback == nil || n == 0 || ctx.Err() != nil ||
+			(!stderrors.Is(err, io.EOF) && !stderrors.Is(err, io.ErrUnexpectedEOF) && !(isNetError && timeout.Timeout())) {
+			return errors.New("anytls: read credential selector").Base(err)
+		}
 	}
-	match := s.validator.Authenticate(string(digest[:]))
+	var match uuidroute.Match
+	if n == len(digest) {
+		match = s.validator.Authenticate(string(digest[:]))
+	}
 	if match.User == nil {
+		if s.fallback != nil {
+			ctx = context.WithValue(ctx, fallbackALPNKey{}, negotiatedALPN(conn))
+			var fallbackErr error
+			serviceErr := s.fallback.service.NewConnection(ctx,
+				&prefixConn{Conn: conn, prefix: bytes.NewReader(digest[:n])},
+				M.SocksaddrFromNet(conn.RemoteAddr()), func(err error) { fallbackErr = err })
+			if serviceErr != nil {
+				return serviceErr
+			}
+			return fallbackErr
+		}
 		return singanytls.ErrAuthentication
+	}
+	if release != nil {
+		release()
 	}
 	if inbound := session.InboundFromContext(ctx); inbound != nil {
 		inbound.Name, inbound.User, inbound.VlessRoute = protocolName, match.User, match.Route
