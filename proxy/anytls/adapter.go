@@ -14,6 +14,7 @@ import (
 	"github.com/sagernet/sing/common/uot"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
+	"github.com/xtls/xray-core/common/log"
 	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal"
@@ -46,7 +47,7 @@ func (h *inboundAdapter) handleTCP(ctx context.Context, conn net.Conn, destinati
 	if !destination.IsValid() {
 		return io.ErrUnexpectedEOF
 	}
-	link, err := h.dispatcher.Dispatch(ctx, fromSocksaddr(destination, xnet.Network_TCP))
+	link, err := h.dispatch(ctx, fromSocksaddr(destination, xnet.Network_TCP))
 	if err != nil {
 		N.ReportHandshakeFailure(conn, err)
 		return err
@@ -81,7 +82,17 @@ func (h *inboundAdapter) dispatchPackets(ctx context.Context, conn net.Conn, pac
 	if p.Timeouts.ConnectionIdle > 0 && p.Timeouts.ConnectionIdle < idle {
 		idle = p.Timeouts.ConnectionIdle
 	}
-	return runUDPAssociation(ctx, conn, packetConn, p, h.dispatcher.Dispatch, idle, udpMaxTargets)
+	return runUDPAssociation(ctx, conn, packetConn, p, h.dispatch, idle, udpMaxTargets)
+}
+
+func (h *inboundAdapter) dispatch(ctx context.Context, destination xnet.Destination) (*transport.Link, error) {
+	ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
+		From:   h.conn.RemoteAddr(),
+		To:     destination,
+		Status: log.AccessAccepted,
+		Email:  h.match.User.Email,
+	})
+	return h.dispatcher.Dispatch(ctx, destination)
 }
 
 // relay owns both copy workers and joins them after interruption. Cancellation

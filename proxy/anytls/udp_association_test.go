@@ -15,9 +15,11 @@ import (
 	"github.com/sagernet/sing/common/uot"
 	"github.com/xtls/xray-core/common/buf"
 	xnet "github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/proxy/uuidroute"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/pipe"
 )
@@ -86,7 +88,8 @@ func newUDPAssociationTest(t *testing.T, connected bool, idle time.Duration, lim
 	}
 	go func() {
 		if useAdapter {
-			h := &inboundAdapter{dispatcher: udpTestDispatcher{dispatch: dispatch}}
+			h := &inboundAdapter{dispatcher: udpTestDispatcher{dispatch: dispatch}, conn: server,
+				match: uuidroute.Match{User: &protocol.MemoryUser{Email: "udp@example.com"}}}
 			f.done <- h.dispatchPackets(ctx, server, uot.NewConn(server, request), policy.SessionDefault())
 			return
 		}

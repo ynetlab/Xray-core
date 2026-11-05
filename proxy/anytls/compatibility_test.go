@@ -15,6 +15,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -545,6 +547,229 @@ func TestUserRemovalKeepsAuthenticatedSession(t *testing.T) {
 		defer conn.Close()
 		if err := checkTCP(conn, []byte("should-reject")); err == nil {
 			t.Fatal("removed user authenticated a new connection")
+		}
+	}
+}
+
+func TestAnyTLSAuthenticationRejectedAccessLogs(t *testing.T) {
+	for _, fallback := range []bool{false, true} {
+		t.Run(fmt.Sprintf("fallback=%v", fallback), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "access.log")
+			address := freeTCPAddress(t)
+			_, port, _ := net.SplitHostPort(address)
+			var portNumber int
+			fmt.Sscan(port, &portNumber)
+			settings := map[string]any{"users": []any{map[string]any{"password": "access-password", "email": "access@example.com"}}}
+			if fallback {
+				settings["fallbacks"] = []any{map[string]any{"dest": compatTCPEcho(t).String()}}
+			}
+			config := map[string]any{
+				"log": map[string]any{"loglevel": "error", "access": path},
+				"inbounds": []any{map[string]any{
+					"tag": "anytls-in", "listen": "127.0.0.1", "port": portNumber, "protocol": "anytls", "settings": settings,
+				}},
+				"outbounds": []any{map[string]any{"protocol": "freedom", "settings": map[string]any{
+					"finalRules": []any{map[string]any{"action": "allow", "ip": []string{"127.0.0.0/8"}}},
+				}}},
+			}
+			encoded, err := json.Marshal(config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			server, err := core.StartInstance("json", encoded)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { server.Close() })
+			conn, err := net.Dial("tcp", address)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { conn.Close() })
+			peer := conn.LocalAddr().String()
+			conn.SetDeadline(time.Now().Add(3 * time.Second))
+			digest := sha256.Sum256([]byte("wrong-password"))
+			if _, err := conn.Write(digest[:]); err != nil {
+				t.Fatal(err)
+			}
+			if fallback {
+				got := make([]byte, len(digest))
+				if _, err := io.ReadFull(conn, got); err != nil || !bytes.Equal(got, digest[:]) {
+					t.Fatalf("fallback did not replay rejected credential: %x, %v", got, err)
+				}
+			} else if _, err := conn.Read(make([]byte, 1)); err == nil {
+				t.Fatal("invalid credential was not rejected")
+			} else if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
+				t.Fatal("invalid credential was not closed promptly")
+			}
+			conn.Close()
+			client, _ := standardClient(t, address, "access-password", nil)
+			validConn, err := client.DialContext(context.Background(), compatTCPEcho(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := checkTCP(validConn, []byte("valid credential")); err != nil {
+				validConn.Close()
+				t.Fatal(err)
+			}
+			validConn.Close()
+			deadline := time.Now().Add(2 * time.Second)
+			for {
+				data, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if bytes.Count(data, []byte("\n")) >= 2 {
+					lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+					if len(lines) != 2 || !strings.Contains(lines[0], "from "+peer+" rejected ") ||
+						!strings.Contains(lines[0], singanytls.ErrAuthentication.Error()) || strings.Contains(lines[0], "email:") ||
+						!strings.Contains(lines[1], " accepted ") || !strings.Contains(lines[1], "email: access@example.com") {
+						t.Fatalf("unexpected authentication access logs: %q", data)
+					}
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("authentication access logs did not arrive: %q", data)
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		})
+	}
+}
+
+func TestAnyTLSAccessLogs(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "access.log")
+	address := freeTCPAddress(t)
+	_, port, _ := net.SplitHostPort(address)
+	var portNumber int
+	fmt.Sscan(port, &portNumber)
+	freedom := map[string]any{"finalRules": []any{map[string]any{"action": "allow", "ip": []string{"127.0.0.0/8"}}}}
+	config := map[string]any{
+		"log": map[string]any{"loglevel": "error", "access": path},
+		"inbounds": []any{map[string]any{
+			"tag": "anytls-in", "listen": "127.0.0.1", "port": portNumber, "protocol": "anytls",
+			"settings": map[string]any{"users": []any{map[string]any{"password": "access-password", "email": "access@example.com"}}},
+		}},
+		"outbounds": []any{
+			map[string]any{"tag": "direct", "protocol": "freedom", "settings": freedom},
+			map[string]any{"tag": "udp-direct", "protocol": "freedom", "settings": freedom},
+		},
+		"routing": map[string]any{"rules": []any{map[string]any{"type": "field", "network": "udp", "outboundTag": "udp-direct"}}},
+	}
+	encoded, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := core.StartInstance("json", encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { server.Close() })
+	client, dials := standardClient(t, address, "access-password", nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	want := make(map[string]int)
+	for i := 0; i < 2; i++ {
+		target := compatTCPEcho(t)
+		conn, err := client.DialContext(ctx, target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := checkTCP(conn, []byte("logged TCP stream")); err != nil {
+			conn.Close()
+			t.Fatal(err)
+		}
+		conn.Close()
+		want["tcp:"+target.String()]++
+	}
+	udpTargets := []M.Socksaddr{compatUDPEcho(t, "udp4", "127.0.0.1:0"), compatUDPEcho(t, "udp4", "127.0.0.1:0")}
+	for _, connected := range []bool{true, false} {
+		conn, err := client.DialContext(ctx, uot.RequestDestination(uot.Version))
+		if err != nil {
+			t.Fatal(err)
+		}
+		conn.SetDeadline(time.Now().Add(5 * time.Second))
+		request := uot.Request{IsConnect: connected, Destination: udpTargets[0]}
+		if err := uot.WriteRequest(conn, request); err != nil {
+			conn.Close()
+			t.Fatal(err)
+		}
+		packets := uot.NewConn(conn, request)
+		targets := udpTargets
+		if connected {
+			targets = targets[:1]
+		}
+		for round := 0; round < 3; round++ {
+			for _, target := range targets {
+				payload := []byte("logged UDP target")
+				if err := packets.WritePacket(sbuf.As(payload), target); err != nil {
+					conn.Close()
+					t.Fatal(err)
+				}
+				buffer := sbuf.NewPacket()
+				source, err := packets.ReadPacket(buffer)
+				ok := source == target && bytes.Equal(buffer.Bytes(), payload)
+				buffer.Release()
+				if err != nil || !ok {
+					conn.Close()
+					t.Fatalf("UDP echo differs: source=%v target=%v err=%v", source, target, err)
+				}
+			}
+		}
+		conn.Close()
+		for _, target := range targets {
+			want["udp:"+target.String()]++
+		}
+	}
+	if dials.Load() != 1 {
+		t.Fatalf("expected pooled AnyTLS session reuse, got %d connections", dials.Load())
+	}
+	wantLines := 0
+	for _, count := range want {
+		wantLines += count
+	}
+	var data []byte
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		data, err = os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Count(data, []byte("\n")) >= wantLines {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("access logs did not arrive: got %q, want %d records", data, wantLines)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	got := make(map[string]int)
+	var peer string
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 11 || fields[2] != "from" || fields[4] != "accepted" || fields[9] != "email:" || fields[10] != "access@example.com" {
+			t.Fatalf("invalid access-log fields: %q", line)
+		}
+		host, _, err := net.SplitHostPort(fields[3])
+		if err != nil || host != "127.0.0.1" || (peer != "" && peer != fields[3]) {
+			t.Fatalf("expected original pooled connection source: %q", line)
+		}
+		peer = fields[3]
+		detour := "[anytls-in >> direct]"
+		if strings.HasPrefix(fields[5], "udp:") {
+			detour = "[anytls-in -> udp-direct]"
+		}
+		if strings.Join(fields[6:9], " ") != detour {
+			t.Fatalf("incorrect inbound/outbound tags: %q", line)
+		}
+		got[fields[5]]++
+	}
+	if len(got) != len(want) {
+		t.Fatalf("logged destinations: got %v, want %v", got, want)
+	}
+	for destination, count := range want {
+		if got[destination] != count {
+			t.Errorf("access logs for %s: got %d, want %d", destination, got[destination], count)
 		}
 	}
 }

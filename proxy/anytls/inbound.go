@@ -16,6 +16,7 @@ import (
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/uot"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/log"
 	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/core"
@@ -154,6 +155,11 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 		match = s.validator.Authenticate(string(digest[:]))
 	}
 	if match.User == nil {
+		log.Record(&log.AccessMessage{
+			From:   conn.RemoteAddr(),
+			Status: log.AccessRejected,
+			Reason: singanytls.ErrAuthentication,
+		})
 		if s.fallback != nil {
 			ctx = context.WithValue(ctx, fallbackALPNKey{}, negotiatedALPN(conn))
 			var fallbackErr error
